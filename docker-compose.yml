@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  frontend:
+    build: ./chatbot-ui
+    container_name: chatbot-frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - app
+
+  app:
+    build: ./backend
+    container_name: chatbot-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/chatbot
+      - REDIS_URL=redis://redis:6379
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:16
+    container_name: chatbot-db
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: chatbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: chatbot-redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chatbot-grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  postgres_data:
+  grafana_data:
