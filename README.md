@@ -13,7 +13,7 @@ A full-stack, event-driven AI chatbot with real-time telemetry, PII redaction, a
 - [Architecture Notes](#architecture-notes)
 - [Tradeoffs](#tradeoffs)
 - [What I'd Improve With More Time](#what-id-improve-with-more-time)
-- [Demo](#demo)
+<!-- - [Demo](#demo) -->
 
 ## Architecture Overview
 
