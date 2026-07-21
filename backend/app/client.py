@@ -14,7 +14,6 @@ class Client(ABC):
 
     @abstractmethod
     def stream_response(self, messages: List[Dict[str, str]]) -> Generator[str, None, None]:
-        """Streams token-by-token response given a list of past messages."""
         pass
 
 

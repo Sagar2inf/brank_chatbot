@@ -13,7 +13,6 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
-    """Dependency injection helper for FastAPI routers."""
     db = SessionLocal()
     try:
         yield db

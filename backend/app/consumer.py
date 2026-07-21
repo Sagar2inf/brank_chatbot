@@ -7,11 +7,7 @@ from app.models import InferenceLog
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
-async def start_ingestion_worker():
-    """
-    Background worker that consumes logs from the Redis Pub/Sub queue 
-    and writes them asynchronously to the PostgreSQL database.
-    """
+async def ingestion_worker():
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         pubsub = redis_client.pubsub()

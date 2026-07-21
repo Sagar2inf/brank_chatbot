@@ -1,15 +1,18 @@
 import json
+import time
 from uuid import UUID
 from typing import List
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, Query
 from sqlalchemy.orm import Session as DBSession
 
 from app.database import get_db, SessionLocal
 from app.models import Base, User, Conversation, Message
 from app.client import ClientFactory
 from app.pii import redact_pii
-from app.sdk import ObservabilityWrapper
+from app.sdk import ObserverWrapper
+from app.auth import get_current_user, get_current_user_ws
+from app.producer import publish_inference_event
 
 router = APIRouter(tags=["chat"])
 
@@ -25,36 +28,45 @@ class ChatMessage(BaseModel):
     class Config:
         from_attributes = True
 
-def get_or_create_default_user(db: DBSession) -> User:
-    user = db.query(User).first()
-    if not user:
-        user = User(username="default_user", password="nopassword")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
+# def get_or_create_default_user(db: DBSession) -> User:
+#     user = db.query(User).first()
+#     if not user:
+#         user = User(username="default_user", password="nopassword")
+#         db.add(user)
+#         db.commit()
+#         db.refresh(user)
+#     return user
 
 
 @router.get("/sessions", response_model=List[SessionResponse])
-async def list_conversations(db: DBSession = Depends(get_db)):
-    conversations = db.query(Conversation).order_by(Conversation.created_at.desc()).all()
+async def list_conversations(db: DBSession = Depends(get_db), curr_user: User = Depends(get_current_user)):
+    conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == curr_user.id)
+        .order_by(Conversation.created_at.desc())
+        .all()
+    )
     return [{"session_id": str(c.id), "title": c.title} for c in conversations]
 
 @router.post("/sessions", response_model=SessionResponse)
-async def create_conversation(db: DBSession = Depends(get_db)):
-    user = get_or_create_default_user(db)
-    new_conv = Conversation(user_id=user.id, title="New Chat")
+async def create_conversation(db: DBSession = Depends(get_db), curr_user: User = Depends(get_current_user)):
+    # user = get_or_create_default_user(db)
+    new_conv = Conversation(user_id=curr_user.id, title="New Chat")
     db.add(new_conv)
     db.commit()
     db.refresh(new_conv)
     return {"session_id": str(new_conv.id), "title": new_conv.title}
 
 @router.get("/sessions/{session_id}", response_model=List[ChatMessage])
-async def resume_conversation(session_id: str, db: DBSession = Depends(get_db)):
+async def resume_conversation(session_id: str, db: DBSession = Depends(get_db), curr_user: User = Depends(get_current_user)):
     try:
         conv_uuid = UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session ID format")
+
+    conv = db.query(Conversation).filter(Conversation.id == conv_uuid).first()
+    if not conv or conv.user_id != curr_user.id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
     messages = (
         db.query(Message)
@@ -67,62 +79,134 @@ async def resume_conversation(session_id: str, db: DBSession = Depends(get_db)):
 
 
 @router.websocket("/stream/{session_id}")
-async def websocket_chat(websocket: WebSocket, session_id: str):
+async def websocket_chat(websocket: WebSocket, session_id: str, token: str = Query(...)):
     await websocket.accept()
-    
     db = SessionLocal() 
     
     try:
+        current_user = await get_current_user_ws(token, db)
+        if not current_user:
+            await websocket.send_json({"type": "error", "content": "Authentication failed"})
+            await websocket.close(code=1008) 
+            return
+
         conv_uuid = UUID(session_id)
+        conv = db.query(Conversation).filter(Conversation.id == conv_uuid).first()
+        
+        if not conv or conv.user_id != current_user.id:
+            await websocket.send_json({"type": "error", "content": "Conversation not found"})
+            await websocket.close(code=1008)
+            return
+
         while True:
-            payload = await websocket.receive_json()
-            raw_message = payload.get("message")
-            provider = payload.get("provider", "groq")
-
-            if not raw_message:
-                continue
-
-            safe_message = redact_pii(raw_message)
+            start_time = time.time()
+            provider = "unknown"
+            safe_message = ""
             
-            new_user_msg = Message(
-                conversation_id=conv_uuid,
-                role="user",
-                content=safe_message
-            )
-            db.add(new_user_msg)
-            db.commit()
+            try:
+                payload = await websocket.receive_json()
+                raw_message = payload.get("message")
+                provider = payload.get("provider", "groq")
 
-            db_messages = (
-                db.query(Message)
-                .filter(Message.conversation_id == conv_uuid)
-                .order_by(Message.created_at.asc())
-                .all()
-            )
-            chat_history = [{"role": m.role, "content": m.content} for m in db_messages]
+                if not raw_message:
+                    continue
 
-            base_client = ClientFactory.get_client(provider)
-            instrumented_client = ObservabilityWrapper(base_client, str(conv_uuid))
-            
-            full_assistant_response = ""
-            
-            async for token in instrumented_client.stream_and_log(chat_history):
-                full_assistant_response += token
-                await websocket.send_json({"type": "token", "content": token})
+                safe_message = redact_pii(raw_message)
+                
+                try:
+                    new_user_msg = Message(
+                        conversation_id=conv_uuid,
+                        role="user",
+                        content=safe_message
+                    )
+                    db.add(new_user_msg)
+                    db.commit()
 
-            new_assistant_msg = Message(
-                conversation_id=conv_uuid,
-                role="assistant",
-                content=full_assistant_response
-            )
-            db.add(new_assistant_msg)
-            db.commit()
+                    db_messages = (
+                        db.query(Message)
+                        .filter(Message.conversation_id == conv_uuid)
+                        .order_by(Message.created_at.asc())
+                        .all()
+                    )
+                    chat_history = [{"role": m.role, "content": m.content} for m in db_messages]
+                    
+                    base_client = ClientFactory.get_client(provider)
+                    sdk_client = ObserverWrapper(base_client, str(conv_uuid))
+                    
+                except Exception as setup_err:
+                    db.rollback()
+                    latency = 0
+                    await publish_inference_event({
+                        "session_id": str(conv_uuid),
+                        "prompt": safe_message,
+                        "response": "",
+                        "provider": provider,
+                        "model": "system",
+                        "latency_ms": round(latency, 2),
+                        "ttft_ms": 0.0,
+                        "status": f"dropped_pre_llm: {str(setup_err)}"
+                    })
+                    await websocket.send_json({"type": "error", "content": "System error: Message dropped."})
+                    continue
 
-            await websocket.send_json({"type": "done"})
+                full_assistant_response = ""
+                try:
+                    async for chunk in sdk_client.stream(chat_history):
+                        await websocket.send_json({"type": "token", "content": chunk})
+                        
+                except Exception as llm_err:
+                    await publish_inference_event({
+                        "session_id": str(conv_uuid),
+                        "prompt": safe_message,
+                        "response": sdk_client.full_response,
+                        "provider": sdk_client.provider,
+                        "model": sdk_client.model,
+                        "latency_ms": round(sdk_client.latency_ms, 2),
+                        "ttft_ms": round(sdk_client.ttft_ms, 2),
+                        "status": f"llm_error: {str(llm_err)}"
+                    })
+                    await websocket.send_json({"type": "error", "content": "AI Provider error."})
+                    continue
 
-    except WebSocketDisconnect:
-        print(f"Client disconnected for session {session_id}")
+                try:
+                    new_assistant_msg = Message(
+                        conversation_id=conv_uuid,
+                        role="assistant",
+                        content=sdk_client.full_response
+                    )
+                    db.add(new_assistant_msg)
+                    db.commit()
+                    
+                    await publish_inference_event({
+                        "session_id": str(conv_uuid),
+                        "prompt": safe_message,
+                        "response": sdk_client.full_response,
+                        "provider": sdk_client.provider,
+                        "model": sdk_client.model,
+                        "latency_ms": round(sdk_client.latency_ms, 2),
+                        "ttft_ms": round(sdk_client.ttft_ms, 2),
+                        "status": "success"
+                    })
+                    await websocket.send_json({"type": "done"})
+                    
+                except Exception as save_err:
+                    db.rollback()
+                    await publish_inference_event({
+                        "session_id": str(conv_uuid),
+                        "prompt": safe_message,
+                        "response": sdk_client.full_response,
+                        "provider": sdk_client.provider,
+                        "model": sdk_client.model,
+                        "latency_ms": round(sdk_client.latency_ms, 2),
+                        "ttft_ms": round(sdk_client.ttft_ms, 2),
+                        "status": f"dropped_post_llm: {str(save_err)}"
+                    })
+
+            except WebSocketDisconnect:
+                print(f"Client disconnected for session {session_id}")
+                break
+                
     except Exception as e:
-        print(f"Error streaming response: {e}")
-        await websocket.send_json({"type": "error", "content": str(e)})
+        print(f"Fatal connection error: {e}")
     finally:
         db.close()

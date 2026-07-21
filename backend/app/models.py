@@ -36,7 +36,6 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)   
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
-    # Relationship back to conversation
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
 class InferenceLog(Base):
