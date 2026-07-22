@@ -112,7 +112,7 @@ export default function Chat() {
       setMessages((prev) => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
-        updated[lastIdx].content += " 🛑 *[Stopped by user]*";
+        updated[lastIdx].content += "*[Stopped by user]*";
         return updated;
       });
     }
