@@ -28,15 +28,6 @@ class ChatMessage(BaseModel):
     class Config:
         from_attributes = True
 
-# def get_or_create_default_user(db: DBSession) -> User:
-#     user = db.query(User).first()
-#     if not user:
-#         user = User(username="default_user", password="nopassword")
-#         db.add(user)
-#         db.commit()
-#         db.refresh(user)
-#     return user
-
 
 @router.get("/sessions", response_model=List[SessionResponse])
 async def list_conversations(db: DBSession = Depends(get_db), curr_user: User = Depends(get_current_user)):
@@ -50,7 +41,6 @@ async def list_conversations(db: DBSession = Depends(get_db), curr_user: User = 
 
 @router.post("/sessions", response_model=SessionResponse)
 async def create_conversation(db: DBSession = Depends(get_db), curr_user: User = Depends(get_current_user)):
-    # user = get_or_create_default_user(db)
     new_conv = Conversation(user_id=curr_user.id, title="New Chat")
     db.add(new_conv)
     db.commit()
@@ -77,7 +67,6 @@ async def resume_conversation(session_id: str, db: DBSession = Depends(get_db), 
     return [{"role": m.role, "content": m.content} for m in messages]
 
 
-
 @router.websocket("/stream/{session_id}")
 async def websocket_chat(websocket: WebSocket, session_id: str, token: str = Query(...)):
     await websocket.accept()
@@ -102,6 +91,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str, token: str = Que
             start_time = time.time()
             provider = "unknown"
             safe_message = ""
+            sdk_client = None 
             
             try:
                 payload = await websocket.receive_json()
@@ -130,42 +120,49 @@ async def websocket_chat(websocket: WebSocket, session_id: str, token: str = Que
                     )
                     chat_history = [{"role": m.role, "content": m.content} for m in db_messages]
                     
+                    # check here for any problem for now
                     base_client = ClientFactory.get_client(provider)
                     sdk_client = ObserverWrapper(base_client, str(conv_uuid))
                     
                 except Exception as setup_err:
-                    db.rollback()
-                    latency = 0
-                    await publish_inference_event({
-                        "session_id": str(conv_uuid),
-                        "prompt": safe_message,
-                        "response": "",
-                        "provider": provider,
-                        "model": "system",
-                        "latency_ms": round(latency, 2),
-                        "ttft_ms": 0.0,
-                        "status": f"dropped_pre_llm: {str(setup_err)}"
-                    })
                     await websocket.send_json({"type": "error", "content": "System error: Message dropped."})
+
+                    try:
+                        await publish_inference_event({
+                            "session_id": str(conv_uuid),
+                            "prompt": safe_message,
+                            "response": getattr(sdk_client, 'full_response', ""),
+                            "provider": getattr(sdk_client, 'provider', provider),
+                            "model": getattr(sdk_client, 'model', "system"),
+                            "latency_ms": round(getattr(sdk_client, 'latency_ms', 0.0), 2),
+                            "ttft_ms": round(getattr(sdk_client, 'ttft_ms', 0.0), 2),
+                            "status": f"dropped_pre_llm: {str(setup_err)}"
+                        })
+                    except Exception as log_err:
+                        print(f"Telemetry Failed: {log_err}")
+
                     continue
 
-                full_assistant_response = ""
                 try:
                     async for chunk in sdk_client.stream(chat_history):
                         await websocket.send_json({"type": "token", "content": chunk})
                         
                 except Exception as llm_err:
-                    await publish_inference_event({
-                        "session_id": str(conv_uuid),
-                        "prompt": safe_message,
-                        "response": sdk_client.full_response,
-                        "provider": sdk_client.provider,
-                        "model": sdk_client.model,
-                        "latency_ms": round(sdk_client.latency_ms, 2),
-                        "ttft_ms": round(sdk_client.ttft_ms, 2),
-                        "status": f"llm_error: {str(llm_err)}"
-                    })
                     await websocket.send_json({"type": "error", "content": "AI Provider error."})
+
+                    try:
+                        await publish_inference_event({
+                            "session_id": str(conv_uuid),
+                            "prompt": safe_message,
+                            "response": getattr(sdk_client, 'full_response', ""),
+                            "provider": getattr(sdk_client, 'provider', provider),
+                            "model": getattr(sdk_client, 'model', "Unknown"),
+                            "latency_ms": round(getattr(sdk_client, 'latency_ms', 0.0), 2),
+                            "ttft_ms": round(getattr(sdk_client, 'ttft_ms', 0.0), 2),
+                            "status": f"llm_error: {str(llm_err)}"
+                        })
+                    except Exception as log_err:
+                        print(f"Telemetry Failed: {log_err}")
                     continue
 
                 try:
@@ -176,31 +173,37 @@ async def websocket_chat(websocket: WebSocket, session_id: str, token: str = Que
                     )
                     db.add(new_assistant_msg)
                     db.commit()
-                    
-                    await publish_inference_event({
-                        "session_id": str(conv_uuid),
-                        "prompt": safe_message,
-                        "response": sdk_client.full_response,
-                        "provider": sdk_client.provider,
-                        "model": sdk_client.model,
-                        "latency_ms": round(sdk_client.latency_ms, 2),
-                        "ttft_ms": round(sdk_client.ttft_ms, 2),
-                        "status": "success"
-                    })
                     await websocket.send_json({"type": "done"})
                     
+                    try:
+                        await publish_inference_event({
+                            "session_id": str(conv_uuid),
+                            "prompt": safe_message,
+                            "response": getattr(sdk_client, 'full_response', ""),
+                            "provider": getattr(sdk_client, 'provider', provider),
+                            "model": getattr(sdk_client, 'model', "Unknown"),
+                            "latency_ms": round(getattr(sdk_client, 'latency_ms', 0.0), 2),
+                            "ttft_ms": round(getattr(sdk_client, 'ttft_ms', 0.0), 2),
+                            "status": "success"
+                        })
+                    except Exception as log_err:
+                        print(f"Telemetry Failed: {log_err}")
+                    
                 except Exception as save_err:
-                    db.rollback()
-                    await publish_inference_event({
-                        "session_id": str(conv_uuid),
-                        "prompt": safe_message,
-                        "response": sdk_client.full_response,
-                        "provider": sdk_client.provider,
-                        "model": sdk_client.model,
-                        "latency_ms": round(sdk_client.latency_ms, 2),
-                        "ttft_ms": round(sdk_client.ttft_ms, 2),
-                        "status": f"dropped_post_llm: {str(save_err)}"
-                    })
+                    await websocket.send_json({"type": "error", "content": "unable to save message and response"})
+                    try:
+                        await publish_inference_event({
+                            "session_id": str(conv_uuid),
+                            "prompt": safe_message,
+                            "response": getattr(sdk_client, 'full_response', ""),
+                            "provider": getattr(sdk_client, 'provider', provider),
+                            "model": getattr(sdk_client, 'model', "Unknown"),
+                            "latency_ms": round(getattr(sdk_client, 'latency_ms', 0.0), 2),
+                            "ttft_ms": round(getattr(sdk_client, 'ttft_ms', 0.0), 2),
+                            "status": f"dropped_post_llm: {str(save_err)}"
+                        })
+                    except Exception as log_err:
+                        print(f"Telemetry Failed: {log_err}")
 
             except WebSocketDisconnect:
                 print(f"Client disconnected for session {session_id}")

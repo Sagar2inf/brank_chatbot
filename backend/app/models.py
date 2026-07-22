@@ -52,6 +52,6 @@ class InferenceLog(Base):
     total_tokens: Mapped[int] = mapped_column(default=0)
     prompt_preview: Mapped[str] = mapped_column(Text)
     response_preview: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(20), index=True) 
+    status: Mapped[str] = mapped_column(String(50), index=True) 
     error: Mapped[str] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), index=True)

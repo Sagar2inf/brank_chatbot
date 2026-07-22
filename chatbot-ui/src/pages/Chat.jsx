@@ -66,9 +66,11 @@ export default function Chat() {
     ws.onopen = () => {
       ws.send(JSON.stringify({ message: userContent, provider }));
     };
+    // console.log(ws)
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      // console.log(data)
       if (data.type === "token") {
         setMessages((prev) => {
           const updated = [...prev];
@@ -79,7 +81,21 @@ export default function Chat() {
           };
           return updated;
         });
-      } else if (data.type === "done" || data.type === "error") {
+      } else if (data.type === "done") {
+        setIsStreaming(false);
+        ws.close();
+      } else if(data.type == "error"){
+        // console.log("Error: ", data.content)
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            content: data.content,
+          };
+          return updated;
+        });
+
         setIsStreaming(false);
         ws.close();
       }
